@@ -4,7 +4,9 @@ import {
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
+  GetObjectCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 // Can be 'local' or 's3'
 const UPLOAD_DESTINATION = import.meta.env.VITE_UPLOAD_DESTINATION || "local";
@@ -35,6 +37,12 @@ export default function VideoRecorder() {
   const partNumberRef = useRef(1);
   const completedPartsRef = useRef([]);
 
+  // Add a ref to store buffered blob data
+  const chunkBufferRef = useRef([]);
+  const chunkBufferSizeRef = useRef(0);
+  const MIN_CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+  // const MIN_CHUNK_SIZE = 20 * 1024;
+
   // start camera + recording
   const startRecording = async () => {
     try {
@@ -49,6 +57,8 @@ export default function VideoRecorder() {
       // Reset upload state
       partNumberRef.current = 1;
       completedPartsRef.current = [];
+      chunkBufferRef.current = [];
+      chunkBufferSizeRef.current = 0;
       setUploadedUrl(null);
 
       // Generate a unique filename for this recording
@@ -78,11 +88,25 @@ export default function VideoRecorder() {
 
       recorder.ondataavailable = async (event) => {
         if (event.data.size > 0 && uploadIdRef.current) {
-          await uploadChunk(event.data);
+          if (UPLOAD_DESTINATION === "s3") {
+            // Buffer chunks for S3 to meet 5MB minimum
+            chunkBufferRef.current.push(event.data);
+            chunkBufferSizeRef.current += event.data.size;
+
+            if (chunkBufferSizeRef.current >= MIN_CHUNK_SIZE) {
+              const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
+              chunkBufferRef.current = [];
+              chunkBufferSizeRef.current = 0;
+              await uploadChunk(combinedBlob);
+            }
+          } else {
+            // Local upload can handle smaller chunks directly
+            await uploadChunk(event.data);
+          }
         }
       };
 
-      recorder.start(3000); 
+      recorder.start(1000); // 1 second intervals
       setRecording(true);
     } catch (error) {
       console.error("Recording error:", error);
@@ -100,7 +124,14 @@ export default function VideoRecorder() {
     setRecording(false);
     
     mediaRecorderRef.current.onstop = async () => {
-         await finishUpload();
+      // Upload any remaining buffered data if we are using S3
+      if (UPLOAD_DESTINATION === "s3" && chunkBufferRef.current.length > 0) {
+        const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
+        chunkBufferRef.current = [];
+        chunkBufferSizeRef.current = 0;
+        await uploadChunk(combinedBlob);
+      }
+      await finishUpload();
     };
   };
 
@@ -111,12 +142,16 @@ export default function VideoRecorder() {
       partNumberRef.current += 1; 
 
       if (UPLOAD_DESTINATION === "s3") {
+        // Convert Blob to Uint8Array to avoid AWS SDK stream reader issues in the browser
+        const buffer = await blob.arrayBuffer();
+        const uint8Array = new Uint8Array(buffer);
+
         const uploadCommand = new UploadPartCommand({
           Bucket: BUCKET,
           Key: filenameRef.current,
           UploadId: uploadIdRef.current,
           PartNumber: currentPartNumber,
-          Body: blob,
+          Body: uint8Array,
         });
 
         const response = await s3.send(uploadCommand);
@@ -166,11 +201,16 @@ export default function VideoRecorder() {
         await s3.send(completeCommand);
         console.log("Upload complete!");
         
-        const finalUrl = `https://${BUCKET}.s3.${import.meta.env.VITE_AWS_REGION}.amazonaws.com/${filenameRef.current}`;
-        setUploadedUrl(finalUrl);
+        const getCommand = new GetObjectCommand({
+          Bucket: BUCKET,
+          Key: filenameRef.current,
+        });
+        
+        const presignedUrl = await getSignedUrl(s3, getCommand, { expiresIn: 3600 });
+        setUploadedUrl(presignedUrl);
       } else {
         console.log("Local upload finished.");
-        setUploadedUrl(`/uploads/${filenameRef.current} (Saved Locally)`);
+        setUploadedUrl(`/uploads/${filenameRef.current}`);
       }
 
       uploadIdRef.current = null;
@@ -228,14 +268,26 @@ export default function VideoRecorder() {
       {uploadedUrl && (
         <div style={{ marginTop: 20, padding: 15, background: "#000", borderRadius: "8px" }}>
           <strong>Upload Successful!</strong>
-          <p>Your video is available at (if bucket is public):</p>
+          <p>Your video is available at (presigned link expires in 1 hour):</p>
           {UPLOAD_DESTINATION === "s3" ? (
-             <a href={uploadedUrl} target="_blank" rel="noopener noreferrer" style={{ wordBreak: "break-all" }}>
+             <a href={uploadedUrl} target="_blank" rel="noopener noreferrer" style={{ wordBreak: "break-all", display: "block", marginBottom: "10px" }}>
                {uploadedUrl}
              </a>
           ) : (
-             <span style={{ wordBreak: "break-all" }}>{uploadedUrl}</span>
+             <span style={{ wordBreak: "break-all", display: "block", marginBottom: "10px" }}>{uploadedUrl} (Saved Locally)</span>
           )}
+          <video
+            src={uploadedUrl}
+            controls
+            style={{
+              width: "100%",
+              maxWidth: "500px",
+              border: "1px solid #ddd",
+              borderRadius: "8px",
+              display: "block",
+              marginTop: "10px"
+            }}
+          />
         </div>
       )}
     </div>
