@@ -1,28 +1,9 @@
 import React, { useRef, useState } from "react";
-import {
-  S3Client,
-  CreateMultipartUploadCommand,
-  UploadPartCommand,
-  CompleteMultipartUploadCommand,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 // Can be 'local' or 's3'
 const UPLOAD_DESTINATION = import.meta.env.VITE_UPLOAD_DESTINATION || "local";
 
-const BUCKET = import.meta.env.VITE_AWS_S3_BUCKET;
-
-// Initialize the S3 client conditionally
-const s3 = UPLOAD_DESTINATION === "s3" ? new S3Client({
-  region: import.meta.env.VITE_AWS_REGION,
-  credentials: {
-    accessKeyId: import.meta.env.VITE_AWS_ACCESS_KEY_ID,
-    secretAccessKey: import.meta.env.VITE_AWS_SECRET_ACCESS_KEY,
-  },
-}) : null;
-
-export default function VideoRecorder() {
+export default function VideoRecorder({ interviewId = "test-interview-id" }) {
   const videoRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -31,17 +12,8 @@ export default function VideoRecorder() {
   const [uploading, setUploading] = useState(false);
   const [uploadedUrl, setUploadedUrl] = useState(null);
 
-  // S3 / Local State Refs
-  const uploadIdRef = useRef(null);
-  const filenameRef = useRef(null);
-  const partNumberRef = useRef(1);
-  const completedPartsRef = useRef([]);
-
-  // Add a ref to store buffered blob data
+  // Buffer Ref
   const chunkBufferRef = useRef([]);
-  const chunkBufferSizeRef = useRef(0);
-  const MIN_CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
-  // const MIN_CHUNK_SIZE = 20 * 1024;
 
   // start camera + recording
   const startRecording = async () => {
@@ -54,31 +26,9 @@ export default function VideoRecorder() {
       streamRef.current = stream;
       videoRef.current.srcObject = stream;
 
-      // Reset upload state
-      partNumberRef.current = 1;
-      completedPartsRef.current = [];
+      // Reset state
       chunkBufferRef.current = [];
-      chunkBufferSizeRef.current = 0;
       setUploadedUrl(null);
-
-      // Generate a unique filename for this recording
-      const filename = `video-${Date.now()}.webm`;
-      filenameRef.current = filename;
-
-      if (UPLOAD_DESTINATION === "s3") {
-        // 1. Initialize S3 Multipart Upload
-        const createCommand = new CreateMultipartUploadCommand({
-          Bucket: BUCKET,
-          Key: filename,
-          ContentType: "video/webm",
-        });
-        
-        const createResponse = await s3.send(createCommand);
-        uploadIdRef.current = createResponse.UploadId;
-      } else {
-        // Local mode doesn't need upload initialization, just reset the ID
-        uploadIdRef.current = "local-upload"; 
-      }
 
       const recorder = new MediaRecorder(stream, {
         mimeType: "video/webm; codecs=vp9",
@@ -86,23 +36,9 @@ export default function VideoRecorder() {
 
       mediaRecorderRef.current = recorder;
 
-      recorder.ondataavailable = async (event) => {
-        if (event.data.size > 0 && uploadIdRef.current) {
-          if (UPLOAD_DESTINATION === "s3") {
-            // Buffer chunks for S3 to meet 5MB minimum
-            chunkBufferRef.current.push(event.data);
-            chunkBufferSizeRef.current += event.data.size;
-
-            if (chunkBufferSizeRef.current >= MIN_CHUNK_SIZE) {
-              const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
-              chunkBufferRef.current = [];
-              chunkBufferSizeRef.current = 0;
-              await uploadChunk(combinedBlob);
-            }
-          } else {
-            // Local upload can handle smaller chunks directly
-            await uploadChunk(event.data);
-          }
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunkBufferRef.current.push(event.data);
         }
       };
 
@@ -124,101 +60,89 @@ export default function VideoRecorder() {
     setRecording(false);
     
     mediaRecorderRef.current.onstop = async () => {
-      // Upload any remaining buffered data if we are using S3
-      if (UPLOAD_DESTINATION === "s3" && chunkBufferRef.current.length > 0) {
+      if (chunkBufferRef.current.length > 0) {
         const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
         chunkBufferRef.current = [];
-        chunkBufferSizeRef.current = 0;
-        await uploadChunk(combinedBlob);
+        await uploadVideo(combinedBlob);
       }
-      await finishUpload();
     };
   };
 
-  const uploadChunk = async (blob) => {
+  const uploadVideo = async (blob) => {
     try {
       setUploading(true);
-      const currentPartNumber = partNumberRef.current;
-      partNumberRef.current += 1; 
+      const filename = `${interviewId}-video-${Date.now()}.webm`;
 
       if (UPLOAD_DESTINATION === "s3") {
-        // Convert Blob to Uint8Array to avoid AWS SDK stream reader issues in the browser
-        const buffer = await blob.arrayBuffer();
-        const uint8Array = new Uint8Array(buffer);
+        console.log("Getting presigned URL from backend...");
+        
+        // 1. Get presigned URL from Backend
+        const uploadUrlResponse = await fetch(`http://localhost:8000/api/v2/interviews/${interviewId}/assets/upload-url`, {
+          method: "POST",
+          headers: {
+            "accept": "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            asset_type: "video_recording",
+            mime_type: "video/webm",
+            filename: filename,
+          }),
+        });
+        
+        if (!uploadUrlResponse.ok) {
+           throw new Error(`Failed to get upload URL: ${uploadUrlResponse.statusText}`);
+        }
 
-        const uploadCommand = new UploadPartCommand({
-          Bucket: BUCKET,
-          Key: filenameRef.current,
-          UploadId: uploadIdRef.current,
-          PartNumber: currentPartNumber,
-          Body: uint8Array,
+        const { upload_url, playback_url, asset_id } = await uploadUrlResponse.json();
+
+        // 2. Upload Video to Presigned URL
+        console.log("Uploading video to S3...");
+        const putResponse = await fetch(upload_url, {
+          method: "PUT",
+          body: blob,
         });
 
-        const response = await s3.send(uploadCommand);
+        if (!putResponse.ok) {
+          throw new Error(`Failed to upload to S3: ${putResponse.statusText}`);
+        }
 
-        completedPartsRef.current.push({
-          ETag: response.ETag,
-          PartNumber: currentPartNumber,
+        // 3. Confirm Upload
+        console.log("Confirming upload with backend...");
+        const confirmResponse = await fetch(`http://localhost:8000/api/v2/interviews/assets/${asset_id}/confirm`, {
+          method: "POST",
+          headers: {
+            "accept": "application/json",
+          },
         });
-        console.log(`S3 Chunk ${currentPartNumber} uploaded successfully.`);
+
+        if (!confirmResponse.ok) {
+           throw new Error(`Failed to confirm upload: ${confirmResponse.statusText}`);
+        }
+        
+        console.log("Upload complete and confirmed!");
+        // The backend generates a secure presigned GET URL for playback
+        setUploadedUrl(playback_url);
 
       } else {
         // Local Upload
-        const isFirstChunk = currentPartNumber === 1;
+        console.log("Starting local upload...");
         await fetch("/api/upload-local", {
           method: "POST",
           headers: {
-             "x-file-name": filenameRef.current,
-             "x-is-first": isFirstChunk.toString()
+             "x-file-name": filename,
+             "x-is-first": "true" // Local middleware might need adjustments since we're sending it all at once now
           },
           body: blob
         });
-        console.log(`Local Chunk ${currentPartNumber} appended successfully.`);
+        console.log("Local upload finished.");
+        setUploadedUrl(`/uploads/${filename}`);
       }
 
     } catch (error) {
       console.error("Upload failed:", error);
     } finally {
       setUploading(false);
-    }
-  };
-
-  const finishUpload = async () => {
-    try {
-      setUploading(true);
-      
-      if (UPLOAD_DESTINATION === "s3") {
-        console.log("Completing multipart upload...");
-        const completeCommand = new CompleteMultipartUploadCommand({
-          Bucket: BUCKET,
-          Key: filenameRef.current,
-          UploadId: uploadIdRef.current,
-          MultipartUpload: {
-            Parts: completedPartsRef.current.sort((a, b) => a.PartNumber - b.PartNumber),
-          },
-        });
-
-        await s3.send(completeCommand);
-        console.log("Upload complete!");
-        
-        const getCommand = new GetObjectCommand({
-          Bucket: BUCKET,
-          Key: filenameRef.current,
-        });
-        
-        const presignedUrl = await getSignedUrl(s3, getCommand, { expiresIn: 3600 });
-        setUploadedUrl(presignedUrl);
-      } else {
-        console.log("Local upload finished.");
-        setUploadedUrl(`/uploads/${filenameRef.current}`);
-      }
-
-      uploadIdRef.current = null;
-
-    } catch (error) {
-      console.error("Failed to complete upload:", error);
-    } finally {
-       setUploading(false);
     }
   };
 
