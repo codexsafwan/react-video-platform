@@ -1,5 +1,6 @@
 import os
 import uuid
+from typing import List
 import boto3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,10 +15,11 @@ app = FastAPI()
 # Enable CORS for the React app on localhost:5173
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag"],
 )
 
 # S3 Configuration from environment variables
@@ -34,52 +36,94 @@ s3_client = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-class UploadUrlRequest(BaseModel):
+class StartMultipartUploadRequest(BaseModel):
     asset_type: str
     mime_type: str
     filename: str
 
-@app.post("/api/v2/interviews/{interview_id}/assets/upload-url")
-def create_upload_url(interview_id: str, payload: UploadUrlRequest):
+@app.post("/api/v2/interviews/{interview_id}/assets/upload-url/start")
+def start_multipart_upload(interview_id: str, payload: StartMultipartUploadRequest):
     if not S3_BUCKET:
         raise HTTPException(status_code=500, detail="S3_BUCKET not configured")
 
-    # Generate a unique asset ID
     asset_id = str(uuid.uuid4())
-    
-    # We can use the filename from the payload, or generate one
     object_key = payload.filename
 
     try:
-        # Generate the presigned URL for PUT object
-        presigned_url = s3_client.generate_presigned_url(
-            'put_object',
-            Params={
-                'Bucket': S3_BUCKET,
-                'Key': object_key,
-                'ContentType': payload.mime_type
-            },
-            ExpiresIn=3600 # 1 hour
-        )
-        
-        # Generate the presigned URL for GET object (Playback)
-        presigned_get_url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={
-                'Bucket': S3_BUCKET,
-                'Key': object_key
-            },
-            ExpiresIn=3600 # 1 hour
+        response = s3_client.create_multipart_upload(
+            Bucket=S3_BUCKET,
+            Key=object_key,
+            ContentType=payload.mime_type
         )
         
         return {
-            "upload_url": presigned_url,
-            "playback_url": presigned_get_url,
-            "asset_id": asset_id
+            "upload_id": response["UploadId"],
+            "asset_id": asset_id,
+            "key": object_key
         }
     except Exception as e:
-        print(f"Error generating presigned URL: {e}")
-        raise HTTPException(status_code=500, detail="Could not generate presigned URL")
+        print(f"Error starting multipart upload: {e}")
+        raise HTTPException(status_code=500, detail="Could not start multipart upload")
+
+class UploadPartRequest(BaseModel):
+    upload_id: str
+    key: str
+    part_number: int
+
+@app.post("/api/v2/interviews/{interview_id}/assets/upload-url/part")
+def get_upload_part_url(interview_id: str, payload: UploadPartRequest):
+    try:
+        presigned_url = s3_client.generate_presigned_url(
+            'upload_part',
+            Params={
+                'Bucket': S3_BUCKET,
+                'Key': payload.key,
+                'UploadId': payload.upload_id,
+                'PartNumber': payload.part_number
+            },
+            ExpiresIn=3600
+        )
+        return {"upload_url": presigned_url}
+    except Exception as e:
+        print(f"Error generating part URL: {e}")
+        raise HTTPException(status_code=500, detail="Could not generate upload part URL")
+
+class CompletedPart(BaseModel):
+    ETag: str
+    PartNumber: int
+
+class CompleteUploadRequest(BaseModel):
+    upload_id: str
+    key: str
+    parts: List[CompletedPart]
+
+@app.post("/api/v2/interviews/{interview_id}/assets/upload-url/complete")
+def complete_multipart_upload(interview_id: str, payload: CompleteUploadRequest):
+    try:
+        # Sort the parts correctly
+        sorted_parts = sorted(payload.parts, key=lambda d: d.PartNumber)
+        
+        s3_client.complete_multipart_upload(
+            Bucket=S3_BUCKET,
+            Key=payload.key,
+            UploadId=payload.upload_id,
+            MultipartUpload={
+                'Parts': [{"ETag": part.ETag.replace('"', ''), "PartNumber": part.PartNumber} for part in sorted_parts]
+            }
+        )
+        
+        presigned_get_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET, 'Key': payload.key},
+            ExpiresIn=3600
+        )
+        
+        return {
+            "playback_url": presigned_get_url
+        }
+    except Exception as e:
+        print(f"Error completing upload: {e}")
+        raise HTTPException(status_code=500, detail="Could not complete upload")
 
 
 @app.post("/api/v2/interviews/assets/{asset_id}/confirm")

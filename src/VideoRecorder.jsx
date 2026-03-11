@@ -14,6 +14,15 @@ export default function VideoRecorder({ interviewId = "test-interview-id" }) {
 
   // Buffer Ref
   const chunkBufferRef = useRef([]);
+  const chunkBufferSizeRef = useRef(0);
+  const MIN_CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+
+  // S3 Presigned Upload State
+  const uploadIdRef = useRef(null);
+  const assetIdRef = useRef(null);
+  const filenameRef = useRef(null);
+  const partNumberRef = useRef(1);
+  const completedPartsRef = useRef([]);
 
   // start camera + recording
   const startRecording = async () => {
@@ -28,17 +37,62 @@ export default function VideoRecorder({ interviewId = "test-interview-id" }) {
 
       // Reset state
       chunkBufferRef.current = [];
+      chunkBufferSizeRef.current = 0;
+      partNumberRef.current = 1;
+      completedPartsRef.current = [];
+      uploadIdRef.current = null;
+      assetIdRef.current = null;
       setUploadedUrl(null);
 
-      const recorder = new MediaRecorder(stream, {
-        mimeType: "video/webm; codecs=vp9",
-      });
+      const filename = `${interviewId}-video-${Date.now()}.webm`;
+      filenameRef.current = filename;
+
+      if (UPLOAD_DESTINATION === "s3") {
+        console.log("Starting multipart upload with backend...");
+        const startResponse = await fetch(`http://localhost:8000/api/v2/interviews/${interviewId}/assets/upload-url/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                asset_type: "video_recording",
+                mime_type: "video/webm",
+                filename: filename
+            })
+        });
+
+        if (!startResponse.ok) throw new Error("Failed to start upload");
+        const data = await startResponse.json();
+        uploadIdRef.current = data.upload_id;
+        assetIdRef.current = data.asset_id;
+      }
+
+      // Pick the best supported codec
+      const mimeType = [
+        "video/webm; codecs=vp9",
+        "video/webm; codecs=vp8",
+        "video/webm",
+        "video/mp4",
+      ].find((m) => MediaRecorder.isTypeSupported(m)) || "";
+
+      const recorder = new MediaRecorder(stream, { mimeType });
 
       mediaRecorderRef.current = recorder;
 
-      recorder.ondataavailable = (event) => {
+      recorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
-          chunkBufferRef.current.push(event.data);
+            if (UPLOAD_DESTINATION === "s3") {
+                chunkBufferRef.current.push(event.data);
+                chunkBufferSizeRef.current += event.data.size;
+
+                if (chunkBufferSizeRef.current >= MIN_CHUNK_SIZE && uploadIdRef.current) {
+                    const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
+                    chunkBufferRef.current = [];
+                    chunkBufferSizeRef.current = 0;
+                    await uploadChunk(combinedBlob);
+                }
+            } else {
+                // Local Upload can handle smaller frames
+                await uploadChunk(event.data);
+            }
         }
       };
 
@@ -63,86 +117,106 @@ export default function VideoRecorder({ interviewId = "test-interview-id" }) {
       if (chunkBufferRef.current.length > 0) {
         const combinedBlob = new Blob(chunkBufferRef.current, { type: "video/webm" });
         chunkBufferRef.current = [];
-        await uploadVideo(combinedBlob);
+        chunkBufferSizeRef.current = 0;
+        await uploadChunk(combinedBlob);
       }
+      await finishUpload();
     };
   };
 
-  const uploadVideo = async (blob) => {
+  const uploadChunk = async (blob) => {
     try {
-      setUploading(true);
-      const filename = `${interviewId}-video-${Date.now()}.webm`;
+        setUploading(true);
+        const currentPartNumber = partNumberRef.current;
+        partNumberRef.current += 1;
 
-      if (UPLOAD_DESTINATION === "s3") {
-        console.log("Getting presigned URL from backend...");
-        
-        // 1. Get presigned URL from Backend
-        const uploadUrlResponse = await fetch(`http://localhost:8000/api/v2/interviews/${interviewId}/assets/upload-url`, {
-          method: "POST",
-          headers: {
-            "accept": "application/json",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            asset_type: "video_recording",
-            mime_type: "video/webm",
-            filename: filename,
-          }),
-        });
-        
-        if (!uploadUrlResponse.ok) {
-           throw new Error(`Failed to get upload URL: ${uploadUrlResponse.statusText}`);
+        if (UPLOAD_DESTINATION === "s3") {
+            console.log(`Getting presigned URL for Part ${currentPartNumber}...`);
+            const partResponse = await fetch(`http://localhost:8000/api/v2/interviews/${interviewId}/assets/upload-url/part`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    upload_id: uploadIdRef.current,
+                    key: filenameRef.current,
+                    part_number: currentPartNumber
+                })
+            });
+
+            if (!partResponse.ok) throw new Error("Failed to get part URL");
+            const { upload_url } = await partResponse.json();
+
+            console.log(`Uploading Part ${currentPartNumber} to S3...`);
+            // Convert to ArrayBuffer so the browser doesn't auto-add Content-Type,
+            // which would cause a SignatureDoesNotMatch error with presigned upload_part URLs.
+            const buffer = await blob.arrayBuffer();
+            const putResponse = await fetch(upload_url, {
+                method: "PUT",
+                body: buffer
+            });
+
+            if (!putResponse.ok) throw new Error(`Failed to upload chunk: ${putResponse.statusText}`);
+            
+            // AWS S3 returns the ETag header for the uploaded part
+            const etag = putResponse.headers.get("ETag");
+            if (!etag) console.warn("ETag not found in S3 response! Check CORS ExposeHeaders config.");
+            
+            completedPartsRef.current.push({
+                ETag: etag || 'mock-etag-if-cors-failed', // Fallback just so React doesn't crash, S3 will reject if invalid
+                PartNumber: currentPartNumber
+            });
+
+        } else {
+            console.log(`Starting local upload chunk ${currentPartNumber}...`);
+            await fetch("/api/upload-local", {
+                method: "POST",
+                headers: {
+                    "x-file-name": filenameRef.current,
+                    "x-is-first": (currentPartNumber === 1).toString()
+                },
+                body: blob
+            });
+            console.log(`Local upload chunk ${currentPartNumber} finished.`);
         }
-
-        const { upload_url, playback_url, asset_id } = await uploadUrlResponse.json();
-
-        // 2. Upload Video to Presigned URL
-        console.log("Uploading video to S3...");
-        const putResponse = await fetch(upload_url, {
-          method: "PUT",
-          body: blob,
-        });
-
-        if (!putResponse.ok) {
-          throw new Error(`Failed to upload to S3: ${putResponse.statusText}`);
-        }
-
-        // 3. Confirm Upload
-        console.log("Confirming upload with backend...");
-        const confirmResponse = await fetch(`http://localhost:8000/api/v2/interviews/assets/${asset_id}/confirm`, {
-          method: "POST",
-          headers: {
-            "accept": "application/json",
-          },
-        });
-
-        if (!confirmResponse.ok) {
-           throw new Error(`Failed to confirm upload: ${confirmResponse.statusText}`);
-        }
-        
-        console.log("Upload complete and confirmed!");
-        // The backend generates a secure presigned GET URL for playback
-        setUploadedUrl(playback_url);
-
-      } else {
-        // Local Upload
-        console.log("Starting local upload...");
-        await fetch("/api/upload-local", {
-          method: "POST",
-          headers: {
-             "x-file-name": filename,
-             "x-is-first": "true" // Local middleware might need adjustments since we're sending it all at once now
-          },
-          body: blob
-        });
-        console.log("Local upload finished.");
-        setUploadedUrl(`/uploads/${filename}`);
-      }
-
     } catch (error) {
-      console.error("Upload failed:", error);
+        console.error("Upload chunk failed:", error);
     } finally {
-      setUploading(false);
+        setUploading(false);
+    }
+  };
+
+  const finishUpload = async () => {
+    try {
+        setUploading(true);
+
+        if (UPLOAD_DESTINATION === "s3") {
+            console.log("Completing multipart upload with backend...");
+            const completeResponse = await fetch(`http://localhost:8000/api/v2/interviews/${interviewId}/assets/upload-url/complete`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    upload_id: uploadIdRef.current,
+                    key: filenameRef.current,
+                    parts: completedPartsRef.current
+                })
+            });
+
+            if (!completeResponse.ok) throw new Error(`Failed to complete upload: ${completeResponse.statusText}`);
+            const { playback_url } = await completeResponse.json();
+
+            // Confirm Upload Flow (Optional tracking in backend DB)
+            await fetch(`http://localhost:8000/api/v2/interviews/assets/${assetIdRef.current}/confirm`, {
+                method: "POST"
+            });
+
+            console.log("Upload complete and confirmed!");
+            setUploadedUrl(playback_url);
+        } else {
+            setUploadedUrl(`/uploads/${filenameRef.current}`);
+        }
+    } catch (error) {
+        console.error("Failed finalization:", error);
+    } finally {
+        setUploading(false);
     }
   };
 
